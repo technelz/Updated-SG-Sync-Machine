@@ -1,0 +1,40 @@
+{
+  "source": {
+    "profile": "default",
+    "account_id": "123prd",
+    "region": "us-west-2",
+    "vpc_id": "vpc-11111prd"
+  },
+  "target": {
+    "profile": "dr-ida",
+    "account_id": "456dr",
+    "region": "us-east-1",
+    "vpc_id": "vpc-2222dr"
+  },
+  "policy": {
+    "reconciliation_mode": "source-required-only",
+    "minimum_apply_confidence": "HIGH",
+    "create_missing_security_groups": true,
+    "sync_tags": true,
+    "preserve_target_extra_rules": true,
+    "block_ambiguous_matches": true,
+    "block_unresolved_dependencies": true,
+    "allow_external_cidr_preservation": false,
+    "allow_relative_cidr_translation": false,
+    "require_post_apply_validation": true,
+    "preserve_universal_cidrs": false
+  },
+  "reporting": {
+    "report_directory": "sg_reports",
+    "rollback_directory": "rollback",
+    "write_json": true,
+    "write_markdown": true
+  },
+  "mapping_overrides": {
+    "security_groups": {},
+    "subnets": {},
+    "prefix_lists": {}
+  },
+  "approved_cidr_mappings": {},
+  "discovery_accounts": []
+}
