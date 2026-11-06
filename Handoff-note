@@ -1,0 +1,587 @@
+# PROJECT HANDOFF — AWS PROD-to-DR Security Group Reconciliation Automation
+
+**Project:** AWS Security Group Live Sync / Workload-Aware Reconciliation Engine  
+**Current iteration:** v4 (proposed consolidated implementation)  
+**Status:** Code developed; offline tests reported as passing; live AWS validation outstanding  
+**Next milestone:** Validate workload-to-CIDR mapping and safely test the reconciliation engine against real AWS environments.
+
+---
+
+## 1. Project Background
+
+I am developing a Python/Boto3 automation tool to synchronize AWS Security Groups between separate Production (PROD) and Disaster Recovery (DR) AWS environments.
+
+The goal is to ensure the DR environment contains all security groups and traffic permissions required to recover production workloads.
+
+### Environment characteristics
+
+- PROD and DR are in separate AWS accounts and may reside in different AWS regions.
+- PROD and DR have different VPC IDs, security group IDs, and CIDR allocations.
+- Security group names are mostly identical across environments, often without an explicit DR suffix.
+- DR networking and non-compute infrastructure are pre-staged.
+- Most DR compute instances are created or recovered only during an actual DR event.
+- PROD-to-DR security group reconciliation must preserve DR-specific rules and configurations.
+
+The tool must discover AWS resources live, identify differences, and safely reconcile them.
+
+**Important:** Matching security group names is relatively straightforward. Correctly translating source network CIDRs is the difficult part.
+
+---
+
+## 2. Original Automation Requirements
+
+The earlier tool was designed to:
+
+1. Authenticate to separate PROD and DR AWS accounts.
+2. Read security groups from the configured PROD and DR VPCs.
+3. Match equivalent security groups.
+4. Identify missing DR security groups.
+5. Create missing security group shells.
+6. Translate PROD security group references to corresponding DR security group IDs.
+7. Compare ingress and egress rules.
+8. Add missing source-required rules.
+9. Preserve additional DR-only rules.
+10. Synchronize applicable resource tags.
+11. Generate reconciliation reports.
+12. Record rollback information.
+13. Re-read DR security groups after changes.
+14. Validate whether the DR environment converged to the expected state.
+
+The operational policy is:
+
+**SOURCE-REQUIRED-ONLY**
+
+This means the DR environment must contain the required source-equivalent permissions, but additional DR rules are tolerated.
+
+The automation must not automatically revoke DR-only rules.
+
+---
+
+## 3. Existing Script History
+
+Three historical Python implementations were uploaded and compared.
+
+### A. sg_reconcile_engine_live.py
+
+Approximately 2,174 lines.
+
+This is the most extensive historical implementation.
+
+Capabilities include:
+
+- Live PROD-to-DR SG comparison.
+- Security group name matching.
+- CloudFormation-based matching.
+- Optional normalized-name matching.
+- Dependency graph construction.
+- Missing SG creation.
+- SG reference translation.
+- Atomic traffic-behavior comparison.
+- Ingress and egress reconciliation.
+- Source-required-only behavior.
+- Tag synchronization.
+- Rollback journaling.
+- Post-apply validation.
+- JSON reporting.
+
+This implementation remains an important reference for preserving mature reconciliation behavior.
+
+### B. sg_reconcile_engine_enhanced.py
+
+Approximately 618 lines.
+
+Introduced network-aware logic, including:
+
+- VPC and subnet discovery.
+- Subnet identity matching.
+- Route fingerprints.
+- VPC CIDR mapping.
+- Relative CIDR translation.
+- Prefix-list mapping.
+- Source CIDR classification.
+
+Its main weakness is that matching subnet characteristics or mathematically translating CIDRs does not establish actual workload equivalence.
+
+### C. sg_reconciliation_engine_intent.py
+
+Approximately 939 lines.
+
+Uses the architecture:
+
+**UNDERSTAND → TRANSLATE → VALIDATE → APPLY → VERIFY**
+
+This was selected as the conceptual foundation for the newer implementation.
+
+It introduced more explicit separation between resource discovery, rule translation, validation, and execution.
+
+During static review, a verification-function argument mismatch was identified. That historical defect needed correction before relying on its post-apply validation.
+
+---
+
+## 4. Critical Discovery From the Network/DR Team
+
+During investigation of PROD security group source CIDRs, a colleague clarified:
+
+**We must trace each workload to its equivalent inside the DR bubble.**
+
+This changed the automation requirement significantly.
+
+Previously, the tool could identify a PROD source CIDR and attempt to translate it to a DR CIDR using VPC or subnet relationships.
+
+That is insufficient.
+
+The correct process is:
+
+1. Identify the source CIDR referenced by the PROD security group.
+2. Determine what workload or network that CIDR represents.
+3. Trace its ownership using AWS resource metadata, ENIs, EC2, subnets, tags, network routes, or authoritative inventory.
+4. Determine whether the workload has a DR equivalent.
+5. Identify the DR subnet or source network assigned to that workload.
+6. Validate the mapping.
+7. Generate the appropriate DR security group rule.
+8. Apply only when the mapping meets the required approval policy.
+
+### Important example
+
+Suppose PROD permits TCP 443 from:
+
+`10.10.1.0/24`
+
+The corresponding DR application subnet may be:
+
+`10.20.1.0/24`
+
+The automation must not conclude that these networks are equivalent simply because their names or address patterns resemble one another.
+
+It must establish their intended workload relationship.
+
+### CIDR classification requirements
+
+The tool must distinguish between:
+
+- PROD-local workload CIDRs requiring translation.
+- Shared network CIDRs that may remain unchanged.
+- On-premises or external network CIDRs.
+- DR-specific networks.
+- Universal CIDRs such as `0.0.0.0/0`.
+- Unknown or ambiguous CIDRs requiring investigation.
+- SG-to-SG references requiring DR SG ID mapping.
+- Managed prefix-list references requiring equivalent DR prefix-list mapping.
+
+Route-table evidence can establish potential network reachability, but does not independently establish workload ownership or authorization.
+
+Unknown mappings must be flagged, not guessed.
+
+---
+
+## 5. Important DR Architecture Constraint
+
+Most DR compute does not exist until a disaster recovery event.
+
+Consequently, the automation cannot depend exclusively on finding running EC2 instances in DR.
+
+It must support:
+
+**Live workload discovery**
+
+Discover existing PROD/DR resources and relationships using AWS APIs.
+
+**Planned workload mapping**
+
+Use approved subnet mappings, workload tags, recovery metadata, or authoritative inventories to identify where a workload will run during recovery.
+
+A missing DR EC2 instance does not necessarily mean that the DR workload mapping is invalid.
+
+The engine should distinguish between a pre-staged network and a missing or unresolved workload.
+
+---
+
+## 6. Security Group Matching Strategy
+
+Most security group names are the same in PROD and DR.
+
+The security group IDs are naturally different.
+
+Preferred matching hierarchy:
+
+1. Explicit approved SG ID mapping.
+2. Unique exact security group name within the configured VPC.
+3. Verified CloudFormation or other stable resource identity.
+4. Unique normalized-name match, subject to validation.
+5. Ambiguous matches are blocked.
+
+Example:
+
+PROD:
+
+- Name: `application-sg`
+- ID: `sg-0123prod`
+
+DR:
+
+- Name: `application-sg`
+- ID: `sg-0456dr`
+
+The engine should resolve the corresponding DR SG ID and rewrite SG references accordingly.
+
+Names and tags are useful mapping evidence but should not override explicit contradictions or ambiguous matches.
+
+---
+
+## 7. Historical Runbooks Reviewed
+
+Two Word documents were uploaded.
+
+### AWS_SG_Live_Sync_Runbook_v3_Current(1).docx
+
+This is the newer and preferred historical runbook.
+
+It describes:
+
+- Source-required-only live reconciliation.
+- Atomic traffic-behavior comparison.
+- Missing SG shell creation.
+- SG dependency mapping.
+- Preservation of additional target rules.
+- Post-apply validation.
+- JSON reports and rollback journals.
+- `--info-file`, `--report-only`, `--dry-run`, and `--yes`.
+
+The atomic comparison is especially important.
+
+Rules are compared using:
+
+- Protocol.
+- FromPort.
+- ToPort.
+- Source/destination type.
+- Source/destination value.
+
+Descriptions, AWS API ordering, grouping differences, and irrelevant metadata should not cause false traffic-rule drift.
+
+### Runbook_AWS Security Group Live Sync Tool.docx
+
+This is the older v1 runbook.
+
+It documents the original PROD-to-DR synchronization process and confirms the core operational behavior.
+
+Both documents should remain available to the new conversation for reference.
+
+---
+
+## 8. Existing JSON Configuration
+
+The original configuration was uploaded as:
+
+`sg_config.json`
+
+It contains:
+
+- `source`: AWS profile, account ID, region, VPC ID.
+- `target`: AWS profile, account ID, region, VPC ID.
+- `policy`: reconciliation behavior and safety controls.
+- `reporting`: report and rollback directories.
+
+Important existing policy values include:
+
+- `reconciliation_mode`: `source-required-only`
+- `minimum_apply_confidence`: `HIGH`
+- `create_missing_security_groups`: `true`
+- `sync_tags`: `true`
+- `preserve_target_extra_rules`: `true`
+- `block_ambiguous_matches`: `true`
+- `block_unresolved_dependencies`: `true`
+- `allow_external_cidr_preservation`: `true`
+- `allow_relative_cidr_translation`: `true`
+- `require_post_apply_validation`: `true`
+
+The new engine must enforce these settings consistently.
+
+**Important:** The legacy settings permitting CIDR preservation or relative translation must not override the newer requirement for verified workload-equivalent mappings.
+
+Keep the original configuration structure wherever possible.
+
+Do not introduce unnecessary separate configuration files.
+
+---
+
+## 9. Newer Implementations Created
+
+Two newer iterations were developed during the conversation.
+
+### Workload-Aware v2
+
+A project package was produced with:
+
+- `sg_workload_reconciler.py`
+- Example configuration.
+- README.
+- Automated tests.
+
+This introduced explicit workload-aware discovery and mapping approval concepts.
+
+However, the user prefers a single main Python script rather than managing multiple competing engines.
+
+### Consolidated v4
+
+The latest proposed deliverables are:
+
+- `sg_reconcile_engine.py` — main consolidated Python engine.
+- `sg_config_ready.json` — updated configuration.
+- `SG_LIVE_SYNC_V4_README.md` — operating instructions.
+- `test_sg_reconcile_engine.py` — offline unit tests.
+
+These are the files the next conversation should use as its starting point.
+
+The v4 iteration was described as preserving the mature reconciliation features while adding workload-aware source mapping, evidence reporting, and mapping approval safeguards.
+
+**Important qualification:** Do not assume every advertised v4 capability is complete without inspecting the actual files. Live AWS integration has not been performed. Verify the implementation directly before making production-readiness claims.
+
+---
+
+## 10. Current Operating Workflow
+
+The preferred command interface remains compatible with the historical runbook.
+
+### Report only
+
+```bash
+python sg_reconcile_engine.py \
+  --info-file sg_config_ready.json \
+  --report-only
+```
+
+### Dry-run
+
+```bash
+python sg_reconcile_engine.py \
+  --info-file sg_config_ready.json \
+  --dry-run
+```
+
+### Apply
+
+```bash
+python sg_reconcile_engine.py \
+  --info-file sg_config_ready.json \
+  --yes \
+  --approve-target ACCOUNT_ID:REGION:VPC_ID
+```
+
+The explicit target approval is an additional safety mechanism.
+
+The actual target account, region, and VPC must match the authenticated AWS identity and configuration.
+
+Do not run apply against the real DR environment until discovery, mapping approval, and dry-run behavior have been validated.
+
+---
+
+## 11. Automated Testing
+
+The current test file is:
+
+`test_sg_reconcile_engine.py`
+
+It contains seven offline tests covering:
+
+1. Blocking unapproved CIDR translations.
+2. Allowing approved CIDR mappings.
+3. Blocking overly broad CIDR mappings.
+4. Preserving extra DR rules.
+5. Translating SG references.
+6. Blocking ambiguous SG matches.
+7. Ensuring legacy configuration flags do not bypass mapping approval.
+
+Run with:
+
+```bash
+python -m unittest -v test_sg_reconcile_engine.py
+```
+
+The previous conversation reported seven tests passing and successful Python compilation.
+
+However, these are offline tests. They do not prove the engine is safe for production.
+
+Additional tests are needed for:
+
+- AWS API failures.
+- IAM authorization errors.
+- Missing SG creation.
+- Dependency cycles.
+- Cross-account SG references.
+- Prefix-list translation.
+- IPv6.
+- Mixed CIDR ranges.
+- Workloads spanning multiple subnets.
+- DR compute absent before recovery.
+- Duplicate names and ambiguous mappings.
+- Partial application failures.
+- Idempotency.
+- Post-apply convergence.
+- Rollback journal correctness.
+- CIDR mapping approval and provenance.
+
+---
+
+## 12. Required Safety Guarantees
+
+These are non-negotiable requirements.
+
+**Read-only by default**
+
+Report-only and dry-run must never modify AWS resources.
+
+**Correct account targeting**
+
+Validate AWS STS account identity, region, and VPC before any writes.
+
+**No guessed network translation**
+
+Never automatically apply a CIDR mapping based solely on subnet names, IP offsets, or route similarity.
+
+**No accidental widening**
+
+Prevent narrower PROD sources from becoming broader DR permissions without explicit, justified approval.
+
+**Preserve DR-specific rules**
+
+The tool follows source-required-only reconciliation and must not automatically delete additional DR rules.
+
+**Safe SG dependency handling**
+
+Create approved missing SG shells first, then resolve target SG IDs before applying SG references.
+
+**Fail closed on unresolved dependencies**
+
+Unknown or ambiguous mappings must not silently fall back to the original PROD CIDR.
+
+**Post-apply verification**
+
+Re-fetch actual DR SG state and verify convergence after changes.
+
+**Auditability**
+
+Every rule translation should include its source, target, discovery evidence, mapping method, approval status, and execution result.
+
+**Partial failure handling**
+
+Record failures and recovery information. Do not claim that a rollback journal constitutes a complete automatic rollback system.
+
+---
+
+## 13. Work Remaining
+
+### Phase 1 — Code audit and consolidation
+
+Inspect the actual v4 script against the historical Live, Enhanced, and Intent implementations.
+
+Confirm that the new version genuinely retains:
+
+- Atomic rule comparison.
+- SG matching.
+- Dependency handling.
+- Missing SG creation.
+- Source-required-only behavior.
+- Prefix-list mapping.
+- Tag synchronization.
+- Reporting.
+- Post-apply validation.
+- Rollback journaling.
+
+Identify any regressions or unimplemented functionality.
+
+Fix defects before further development.
+
+### Phase 2 — Workload discovery
+
+Improve the source-discovery engine to trace CIDRs to:
+
+- VPC subnets.
+- Network interfaces.
+- EC2 workloads.
+- Load balancers.
+- Relevant AWS-managed resources.
+- Shared networks and external routes.
+- Approved workload inventories or DR recovery metadata.
+
+Do not claim that CIDR containment alone identifies a specific workload.
+
+### Phase 3 — DR equivalent identification
+
+Develop reliable mapping between PROD workloads and planned DR equivalents.
+
+Use stable workload identities, application tags, subnet roles, and approved recovery metadata.
+
+Support environments where DR compute is not yet deployed.
+
+### Phase 4 — Network mapping approval
+
+Ensure mapping decisions are auditable.
+
+For every source CIDR, record:
+
+- Source network.
+- Source workload or owner.
+- Proposed DR network.
+- Evidence.
+- Mapping method.
+- Confidence.
+- Approval.
+- Unresolved issues.
+
+Require authoritative approval before automatic remediation.
+
+### Phase 5 — Expand tests
+
+Build robust mocked AWS integration tests and realistic fixtures.
+
+Validate the entire plan/apply/verify lifecycle, including failure conditions and idempotency.
+
+### Phase 6 — Read-only AWS validation
+
+Run report-only against the actual PROD and DR environments.
+
+Inspect generated mapping and reconciliation reports.
+
+Identify false positives, ambiguous matches, and missing discovery permissions.
+
+### Phase 7 — Controlled remediation
+
+Validate changes in a non-production environment first.
+
+Then use a reviewed dry-run plan, explicit approval, and controlled change window for real DR remediation.
+
+Verify post-apply convergence and retain reports.
+
+### Phase 8 — Final operational documentation
+
+Update the v3 runbook into a final version reflecting the tested engine.
+
+Include configuration, IAM permissions, commands, troubleshooting, limitations, rollback procedures, and operational safeguards.
+
+---
+
+## 14. Instructions for the Next ChatGPT Conversation
+
+Continue this project from the latest consolidated v4 implementation.
+
+Do not start over or produce a simplistic replacement.
+
+Use the uploaded historical scripts and runbooks to understand the established behavior.
+
+Prioritize delivering:
+
+1. One complete, maintainable Python engine.
+2. One configuration JSON based on the original structure.
+3. A comprehensive automated test suite.
+4. A concise, accurate operating runbook.
+
+Focus especially on the requirement that **every PROD source workload must be traced to its appropriate DR bubble equivalent before a translated CIDR is approved for synchronization**.
+
+Distinguish verified functionality from proposed functionality.
+
+Do not invent AWS inventory data or assume the real accounts have been tested.
+
+The next immediate task should be to inspect the current v4 script and configuration, compare them against the v3 runbook and historical implementations, identify any remaining gaps, and implement the highest-priority corrections.
+
+**End of handoff.**
